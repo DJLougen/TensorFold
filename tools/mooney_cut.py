@@ -101,6 +101,7 @@ def main() -> int:
         out_entries[name] = {"dtype": entry["dtype"], "shape": entry["shape"],
                              "data_offsets": [at, at + size]}
         at += size
+        at = (at + 7) & ~7                     # safetensors: every tensor's start is 8-aligned
     out_header = json.dumps(out_entries, separators=(",", ":")).encode()
     pad = -len(out_header) % 8
     out_header += b" " * pad
@@ -124,6 +125,9 @@ def main() -> int:
                     out.write(chunk)
                     left -= len(chunk)
                     total += len(chunk)
+            pad = (-(end - start)) & 7
+            if pad:
+                out.write(b"\0" * pad)
             if i % 200 == 0:
                 print(f"  {i}/{len(order)} {name} ({total / 2**30:.1f} GiB)", flush=True)
     idx_out = {"metadata": {"total_size": total},
