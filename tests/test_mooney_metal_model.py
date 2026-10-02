@@ -61,7 +61,10 @@ def test_rotation_is_applied_not_cosmetic():
     with_rot = _forward(inner, [3, 1, 4])
     mods = [m for _, m in inner.named_modules() if isinstance(m, MooneySwitchGLU)]
     assert mods, "no rotated layers attached"
+    from mlx_lm.models.switch_layers import SwitchGLU
+
     for m in mods:
-        m.__dict__.pop("mooney", None)     # fused _moe reads this dict; dropping it = same weights, no transform
+        m.__dict__.pop("mooney", None)     # fused _moe reads this dict
+        m.__class__ = SwitchGLU            # the module path reads the class; both = same weights, no transform
     without_rot = _forward(inner, [3, 1, 4])
     assert not np.allclose(with_rot, without_rot), "rotation made no difference — transform not applied"
