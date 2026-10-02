@@ -50,21 +50,25 @@ def _validate(x, q):
     return n, k
 
 
-def matmul(x, q, *, f32: bool = False):
+def matmul(x, q, *, f32: bool = False, out=None):
     import torch
     import triton
     from . import affine_kernels as kernels
 
     n, k = _validate(x, q)
     x = x.contiguous()
-    out = torch.empty((x.shape[0], n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+    if out is None:
+        out = torch.empty((x.shape[0], n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+    elif out.shape[0] != x.shape[0] or out.shape[1] < n or out.stride(1) != 1:
+        raise ValueError("affine out must hold [rows, >= n] unit-stride columns")
     if q.layout == "dense":
         kernels.dense[(x.shape[0], triton.cdiv(n, 4))](x, q.weight, out, N=n, K=k, BLOCK=128,
+                                                     OSTRIDE=out.stride(0),
                                                      num_warps=4, enable_fp_fusion=False)
     else:
         kernels.matmul[(triton.cdiv(x.shape[0], 16), triton.cdiv(n, 32))](
             x, q.weight, q.scales, q.biases, out, x.shape[0], N=n, K=k, BITS=q.bits, GS=q.gs,
-            num_warps=4, enable_fp_fusion=False)
+            OSTRIDE=out.stride(0), num_warps=4, enable_fp_fusion=False)
     return out
 
 

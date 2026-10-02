@@ -59,7 +59,8 @@ class Buffers:
         self.gated = torch.empty((rows, c.heads * c.head_dim), dtype=bf, device=dev)
         self.xs_gated = torch.empty((rows, c.heads * c.head_dim // 32), dtype=f32, device=dev)
         # the experts' prefill arithmetic for decode windows too (``moe_prefill``): their rows can share a pass's launch
-        self.moe = moe_mod.MoEBuffers(rows, _MoECfg(c), dev, prefill=prefill if moe_prefill is None else moe_prefill)
+        self.moe = moe_mod.MoEBuffers(rows, _MoECfg(c), dev, prefill=prefill if moe_prefill is None else moe_prefill,
+                                      mooney=getattr(w, "mooney", None) is not None)
         # DeltaNet projections and outputs and attention outputs; ``commit`` reads the projections' conv channels
         lin = 1 if prefill else sum(1 for layer in w.layers if layer.linear)     # a prompt chunk commits each layer
         self.proj = torch.zeros((lin, rows, gdn_mod.widths(c.nk, c.nv)[1]), dtype=bf, device=dev)
@@ -86,9 +87,13 @@ class Buffers:
         # n-gram embedding
         nrow = rows * 2 * c.heads_per_ngram
         dh = c.ple_dim // (2 * c.heads_per_ngram)
-        self.ple_w = torch.zeros((nrow, dh // 8), dtype=torch.int32, device=dev)
-        self.ple_s = torch.zeros((nrow, dh // 32), dtype=bf, device=dev)
-        self.ple_b = torch.zeros((nrow, dh // 32), dtype=bf, device=dev)
+        # the table's stored format (MLX affine, group 32): bits size the packed words; meta its scalar dtype
+        table = next((layer.ple.table for layer in w.layers if layer.ple is not None), None)
+        ple_bits = int(getattr(table, "bits", 4))
+        ple_meta = torch.float16 if getattr(table, "meta", "bf16") == "f16" else bf
+        self.ple_w = torch.zeros((nrow, dh * ple_bits // 32), dtype=torch.int32, device=dev)
+        self.ple_s = torch.zeros((nrow, dh // 32), dtype=ple_meta, device=dev)
+        self.ple_b = torch.zeros((nrow, dh // 32), dtype=ple_meta, device=dev)
         pin = torch.cuda.is_available()
         self.ple_hw = torch.zeros((nrow, dh // 8), dtype=torch.int32, pin_memory=pin)
         self.ple_hs = torch.zeros((nrow, dh // 32), dtype=torch.int16, pin_memory=pin)

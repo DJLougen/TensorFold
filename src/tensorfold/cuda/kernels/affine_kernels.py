@@ -15,7 +15,8 @@ def codes(W, n, k, valid, KW: tl.constexpr, BITS: tl.constexpr):
 
 
 @triton.jit
-def matmul(X, W, S, B, OUT, M, N: tl.constexpr, K: tl.constexpr, BITS: tl.constexpr, GS: tl.constexpr):
+def matmul(X, W, S, B, OUT, M, N: tl.constexpr, K: tl.constexpr, BITS: tl.constexpr, GS: tl.constexpr,
+            OSTRIDE: tl.constexpr):
     rows = tl.program_id(0) * 16 + tl.arange(0, 16)
     cols = tl.program_id(1) * 32 + tl.arange(0, 32)
     within = tl.arange(0, GS)
@@ -29,11 +30,12 @@ def matmul(X, W, S, B, OUT, M, N: tl.constexpr, K: tl.constexpr, BITS: tl.conste
         bias = tl.load(B + cols * (K // GS) + group, mask=cols < N, other=0).to(tl.float32)
         sums = tl.sum(x.to(tl.float32), 1)
         acc = acc + dot * scale[None, :] + sums[:, None] * bias[None, :]
-    tl.store(OUT + rows[:, None] * N + cols[None, :], acc, mask=(rows[:, None] < M) & (cols[None, :] < N))
+    tl.store(OUT + rows[:, None] * OSTRIDE + cols[None, :], acc.to(OUT.dtype.element_ty),
+             mask=(rows[:, None] < M) & (cols[None, :] < N))
 
 
 @triton.jit
-def dense(X, W, OUT, N: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
+def dense(X, W, OUT, N: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr, OSTRIDE: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.program_id(1) * 4 + tl.arange(0, 4)
     offsets = tl.arange(0, BLOCK)
@@ -43,7 +45,7 @@ def dense(X, W, OUT, N: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
         x = tl.load(X + row * K + k, mask=k < K, other=0).to(tl.float32)
         weight = tl.load(W + cols[:, None] * K + k[None, :], mask=(cols[:, None] < N) & (k[None, :] < K), other=0)
         acc = acc + tl.sum(weight.to(tl.float32) * x[None, :], 1)
-    tl.store(OUT + row * N + cols, acc, mask=cols < N)
+    tl.store(OUT + row * OSTRIDE + cols, acc.to(OUT.dtype.element_ty), mask=cols < N)
 
 
 @triton.jit

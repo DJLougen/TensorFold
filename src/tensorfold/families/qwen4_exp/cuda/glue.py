@@ -408,7 +408,8 @@ def attn_gate(o: torch.Tensor, p: torch.Tensor, out: torch.Tensor, xs: torch.Ten
 
 
 @triton.jit
-def _ple_embed(W, S, B, OUT, XS, HEADS: tl.constexpr, DH: tl.constexpr, SCALE: tl.constexpr):
+def _ple_embed(W, S, B, OUT, XS, HEADS: tl.constexpr, DH: tl.constexpr, SCALE: tl.constexpr,
+               BITS: tl.constexpr):
     """Program (r, h): gathered n-gram row r * HEADS + h (DH values, MLX layout, group 32) -> OUT[r, h DH: (h + 1) DH] bf16 and its group sums."""
 
     r = tl.program_id(0)
@@ -417,9 +418,12 @@ def _ple_embed(W, S, B, OUT, XS, HEADS: tl.constexpr, DH: tl.constexpr, SCALE: t
     row = (r * HEADS + h).to(tl.int64)
     gi = tl.arange(0, 8)
     gok = gi < G
-    wi = tl.arange(0, 4)
-    words = tl.load(W + row * (DH // 8) + gi[:, None] * 4 + wi[None, :], mask=gok[:, None], other=0)
-    q = tl.reshape((words[:, :, None] >> (tl.arange(0, 8) * 4)[None, None, :]) & 0xF, (8, 32)).to(tl.float32)
+    wi = tl.arange(0, BITS)                                    # one word per 32 // BITS columns
+    lane = tl.arange(0, 32 // BITS)
+    words = tl.load(W + row * (DH * BITS // 32) + gi[:, None] * BITS + wi[None, :],
+                    mask=gok[:, None], other=0)
+    q = tl.reshape((words[:, :, None] >> (lane * BITS)[None, None, :]) & ((1 << BITS) - 1),
+                   (8, 32)).to(tl.float32)
     s = tl.load(S + row * G + gi, mask=gok, other=0.0).to(tl.float32)
     b = tl.load(B + row * G + gi, mask=gok, other=0.0).to(tl.float32)
     v = (q * s[:, None] + b[:, None]).to(tl.bfloat16)
@@ -431,10 +435,11 @@ def _ple_embed(W, S, B, OUT, XS, HEADS: tl.constexpr, DH: tl.constexpr, SCALE: t
 
 
 def ple_embed(rows: int, weight: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor, heads: int, dh: int,
-              out: torch.Tensor, xs: torch.Tensor, *, scale: float = 1.0) -> None:
+              out: torch.Tensor, xs: torch.Tensor, *, scale: float = 1.0, bits: int = 4) -> None:
     """Gathered rows (``weights.HostTable.gather``, row r * heads + h) -> out [rows, heads * dh] bf16."""
 
-    _ple_embed[(rows, heads)](weight, scales, biases, out, xs, HEADS=heads, DH=dh, SCALE=scale, num_warps=1)
+    _ple_embed[(rows, heads)](weight, scales, biases, out, xs, HEADS=heads, DH=dh, SCALE=scale, BITS=bits,
+                              num_warps=1)
 
 
 @triton.jit

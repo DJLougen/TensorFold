@@ -37,8 +37,16 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     from dataclasses import replace
 
     from . import exl3
+    from .. import mooney as mooney_manifest
 
     model_dir = Path(model_dir)
+    if mooney_manifest.is_mooney(model_dir):          # a Mooney pack: rotated experts, its own loader
+        if tp not in (None, (0, 1)):
+            raise ValueError("Mooney packs run on one GPU (the rotated experts do not shard); drop --tp 2")
+        from . import mooney_load
+
+        return mooney_load.load(model_dir, device, mtp=mtp, draft_vocab=draft_vocab,
+                                ple_on_ssd=ple_on_ssd, table_reads=table_reads)
     if exl3.is_exl3(model_dir):                       # an EXL3 pack: its own loader, the same dataclasses
         return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads)
     full = Config.read(model_dir)

@@ -41,11 +41,19 @@ def _mm(x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, out: torch.Tensor, b: Buff
 
 
 def _embed(w: Weights, ids: torch.Tensor, copies: int, out: torch.Tensor) -> torch.Tensor:
-    if len(w.embed) == 1:     # an unquantized embedding: an EXL3 pack's, or an NVFP4 checkpoint's BF16 table
-        from .exl3_mm import embed
+    if isinstance(w.embed, tuple):
+        if len(w.embed) == 1:     # an unquantized embedding: an EXL3 pack's, or an NVFP4 checkpoint's BF16 table
+            from .exl3_mm import embed
 
-        return embed(ids, w.embed[0], w.cfg.hidden, copies, out)
-    return glue.embed(ids, *w.embed, w.cfg.hidden, copies=copies, out=out)
+            return embed(ids, w.embed[0], w.cfg.hidden, copies, out)
+        return glue.embed(ids, *w.embed, w.cfg.hidden, copies=copies, out=out)
+    from tensorfold.cuda.kernels import affine
+
+    emb = affine.embed(ids, w.embed)            # a Mooney pack's embedding at its stored format
+    out[:, :emb.shape[1]].copy_(emb)
+    for c in range(1, copies):
+        out[:, c * emb.shape[1]:(c + 1) * emb.shape[1]].copy_(emb)
+    return out
 
 
 def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mode: int, inject_prev,
@@ -285,7 +293,7 @@ def ple_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int
         _mm(b.ple_emb[:R], p.value, b.xs_ple[:R], b.ple_vals[:R], b)
     else:
         glue.ple_embed(R, b.ple_w, b.ple_s, b.ple_b, p.ngram.heads, p.ngram.dims, b.ple_emb[:R], b.xs_ple[:R],
-                       scale=getattr(p.table, "weight_scale", 1.0))
+                       scale=getattr(p.table, "weight_scale", 1.0), bits=int(getattr(p.table, "bits", 4)))
         _mm(b.ple_emb[:R], p.key, b.xs_ple[:R], b.ple_keys[:R], b)
         _mm(b.ple_emb[:R], p.value, b.xs_ple[:R], b.ple_vals[:R], b)
     glue.ple_gate(b.ple_keys[:R], b.ple_vals[:R], b.h[:R], p.norm_key, p.norm_query, b.ple_gated[:R],
@@ -311,8 +319,8 @@ def stage_ple_rows(p, b: Buffers, ids: np.ndarray, at: int = 0) -> None:
     b.ple_hs[rows].numpy()[:] = scales.view(np.int16)
     b.ple_hb[rows].numpy()[:] = biases.view(np.int16)
     b.ple_w[rows].copy_(b.ple_hw[rows], non_blocking=True)
-    b.ple_s[rows].copy_(b.ple_hs[rows].view(torch.bfloat16), non_blocking=True)
-    b.ple_b[rows].copy_(b.ple_hb[rows].view(torch.bfloat16), non_blocking=True)
+    b.ple_s[rows].copy_(b.ple_hs[rows].view(b.ple_s.dtype), non_blocking=True)
+    b.ple_b[rows].copy_(b.ple_hb[rows].view(b.ple_b.dtype), non_blocking=True)
 
 
 def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
@@ -324,12 +332,49 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
         nvfp4_moe.moe(b.mixed[:R], b.xs_mixed[:R], m.router, m.experts, buf, _MoECfg(w.cfg))
     elif w.x3 is not None:                              # an EXL3 pack: each expert at its own width, one GPU
         return _exl3_moe(m, w, b, R)
+    elif getattr(m.experts, "kernel", "qmm") == "mooney":        # a Mooney pack's rotated experts
+        buf = b.moe
+        _mooney_moe(b.mixed[:R], m.experts, buf, w.cfg.top_k, w.cfg.experts, m.router)
     else:
         buf = moe_mod.moe(b.mixed[:R], m.router, m.experts, b.moe, w.cfg.top_k, w.cfg.experts)
     if w.comm is None:
         return 2, buf.y[:R], buf.wts[:R]
     glue.moe_partial(buf.y[:R], buf.wts[:R], b.part_moe, R)
     return 3, _gather(w, b, b.part_moe, b.g_moe, R), None
+
+
+def _mooney_moe(x: torch.Tensor, ex, buf, top_k: int, experts: int, router_rows: torch.Tensor) -> None:
+    """Mooney's MoE into buf.y: rotate gate/up inputs per their manifest specs, run the routed pairs
+    grouped, run the shared expert on the ordinary affine matmuls (``buf.act[:, top_k]`` slot)."""
+
+    from . import mooney as ck
+
+    moe_mod.router(x, router_rows, buf.logits[:x.shape[0]])
+    buf.plan.tile = 16                              # the mooney kernels take items of 16 pairs
+    moe_mod.select(buf.logits[:x.shape[0]], buf, top_k, experts, tile=16)
+    if ex.rot_gate is not None:
+        ex.rot_gate.apply(x, buf.rot_g[:x.shape[0]])
+        ex.rot_up.apply(x, buf.rot_u[:x.shape[0]])
+    else:
+        buf.rot_g[:x.shape[0]].copy_(x)
+        buf.rot_u[:x.shape[0]].copy_(x)
+    act = buf.act.view(-1, buf.act.shape[-1])
+    ex.gate_up(buf.rot_g[:x.shape[0]], buf.rot_u[:x.shape[0]], buf.plan, act)
+    rows = x.shape[0]
+    if ex.rot_down is not None:
+        ex.rot_down.apply(act, buf.rot_d.view(-1, act.shape[1])[:rows * buf.slots])
+        d_in = buf.rot_d.view(-1, act.shape[1])[:rows * buf.slots]
+    else:
+        d_in = act
+    ex.down_proj(d_in, buf.plan, buf.y.view(-1, buf.y.shape[-1]))
+    # the shared expert: slot ``top_k`` of every row of act/y (unrotated weights, the plain input)
+    sg = ex.shared_gate(x).float()
+    su = ex.shared_up(x).float()
+    act[torch.arange(rows, device=x.device) * buf.slots + top_k, :ex.shared_width] = (
+        sg / (1.0 + torch.exp(-sg)) * su).to(torch.bfloat16)
+    ex.shared_down(buf.act[:, top_k, :ex.shared_width],
+                   out=buf.y[:, top_k, :].view(rows, buf.y.shape[-1]))
+    return buf
 
 
 def _exl3_moe(m, w: Weights, b: Buffers, R: int) -> tuple:
@@ -493,7 +538,8 @@ def converges(w: Weights) -> bool:
     """Whether a decode window and a prompt pass can share each layer's expert launch (grouped 4-bit experts, one GPU)."""
 
     return w.comm is None and getattr(w, "x3", None) is None and all(
-        getattr(getattr(getattr(layer, "moe", None), "experts", None), "kernel", "qmm") == "qmm" for layer in w.layers)
+        getattr(getattr(getattr(layer, "moe", None), "experts", None), "kernel", "qmm")
+        in ("qmm", "mooney") for layer in w.layers)
 
 
 def compute_mixed(w: Weights, dsegs: Sequence[Seg], db: Buffers, psegs: Sequence[Seg], pb: Buffers, *,

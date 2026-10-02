@@ -61,6 +61,7 @@ class HostTable:
 
     def __init__(self, files: list[tuple[Path, dict, dict, dict]]) -> None:
         self.words, self.scales, self.biases, starts = [], [], [], [0]
+        self._scales_dtype = files[0][2].get("dtype") if files and isinstance(files[0][2], dict) else None
         maps: dict = {}
         fidx, wbase, sbase, bbase = [], [], [], []
         for path, hw, hs, hb in files:
@@ -87,6 +88,17 @@ class HostTable:
         self.wbase, self.sbase, self.bbase = (np.array(x, dtype=np.int64) for x in (wbase, sbase, bbase))
         self.wrow = self.words[0].shape[1] * 4
         self.grow = self.scales[0].shape[1] * 2
+        # the shards' format: K = 32 values a scalar group; bits from each row's word bytes vs scalars
+        self.meta = {"BF16": "bf16", "F16": "f16"}.get(self._scales_dtype)
+        if self.meta is None:
+            raise ValueError("the n-gram shards' scales must be bf16 or fp16")
+        groups = self.grow // 2                            # scalar columns
+        k = groups * 32
+        self.bits = self.wrow * 8 // k if k and self.wrow * 8 % k == 0 else 0
+        if self.bits not in (4, 8):
+            raise ValueError(f"n-gram shards: {self.wrow} word bytes and {groups} scalar groups a row "
+                             f"are not 4- or 8-bit MLX rows of groups of 32")
+        self.width = k
         self.nbytes = sum(a.nbytes for a in self.words + self.scales + self.biases)
         # threads start with the first threaded gather
         self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")

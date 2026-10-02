@@ -34,13 +34,24 @@ def has_mtp(model_dir: Path) -> bool:
 def check_quantization(config: dict[str, Any], backend: str) -> None:
     """Refuse from config.json alone an MLX format the kernels do not read: affine 2-8 bits in groups of 32-128."""
 
-    from tensorfold.quantization import checkpoint_specs
+    from tensorfold.quantization import checkpoint_specs, quantization_block
 
-    specs = [spec for spec in checkpoint_specs(config).values() if spec is not None]
+    # glob-style per-module maps are resolved at load, not here; rebuild the dicts so the caller's
+    # config is unchanged
+    cleaned = dict(config)
+    inner = dict(config.get("text_config") or {})
+    cleaned["text_config"] = inner
+    for source in (cleaned, inner):
+        for key in ("quantization", "quantization_config"):
+            if isinstance(source.get(key), dict) and "modules" in source[key]:
+                source[key] = {k: v for k, v in source[key].items() if k != "modules"}
+    specs = [spec for spec in checkpoint_specs(cleaned).values() if spec is not None]
     if not specs:
         raise ValueError(f"{TITLE} reads MLX affine-quantized weights; this checkpoint has none. Use {MODELS[0]}.")
     formats = {(spec.bits, spec.group_size) for spec in specs}
-    if backend == "cuda" and formats != {CUDA_QUANTIZATION}:
+    # a Mooney pack mixes rotated 2-bit experts with 8-bit tensors; its manifest is checked in check()
+    mooney_formats = formats <= {(8, 32), (2, 128)}
+    if backend == "cuda" and formats != {CUDA_QUANTIZATION} and not mooney_formats:
         bits, group = CUDA_QUANTIZATION
         raise ValueError(f"{TITLE}'s CUDA kernels read {bits}-bit weights in groups of {group}; this checkpoint has "
                          f"{', '.join(f'{b}-bit g{g}' for b, g in sorted(formats))}. Use {MODELS[0]}.")
@@ -49,6 +60,26 @@ def check_quantization(config: dict[str, Any], backend: str) -> None:
 def check(model_dir: Path) -> None:
     from tensorfold.families import EXL3_QUANT, OWN_MODEL_HELP, describe_quantization, quant_method, read_config
 
+    from . import mooney
+
+    model_dir = Path(model_dir)
+    if mooney.is_mooney(model_dir):
+        # a Mooney pack: refuse its manifest's defects before any weight file is read
+        index = Path(model_dir) / "model.safetensors.index.json"
+        names = None
+        if index.is_file():
+            try:
+                names = set(__import__("json").loads(index.read_text()).get("weight_map") or {})
+            except ValueError:
+                names = None
+        reason = mooney.refusal(model_dir, names)
+        if reason is not None:
+            raise ValueError(reason)
+        if ((Path(model_dir) / "model.safetensors.index.json").is_file()
+                or any(Path(model_dir).glob("model*.safetensors"))) and not has_mtp(model_dir):
+            print(f"[tensorfold] this checkpoint has no MTP head: decoding without MTP drafts "
+                  f"({MODELS[0]} has one)", flush=True)
+        return
     config = read_config(model_dir)
     if quant_method(config) == EXL3_QUANT:
         # an EXL3 pack (the CUDA engine, any codebook and per-tensor width): only the MTP head to report

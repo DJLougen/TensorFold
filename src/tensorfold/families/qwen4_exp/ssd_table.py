@@ -13,7 +13,8 @@ import numpy as np
 
 WORKERS = 16                # reads in flight at once: os.pread releases the GIL
 MAX_READ = 1 << 20          # bytes one read of adjacent rows may cover
-_KINDS = (("weight", "U32", 4), ("scales", "BF16", 2), ("biases", "BF16", 2))
+_META = ("BF16", "F16")                          # scales/biases: bf16, or fp16 in Mooney packs
+_KINDS = (("weight", "U32", 4), ("scales", _META, 2), ("biases", _META, 2))
 
 
 def _no_cache(fd: int) -> None:
@@ -37,7 +38,7 @@ def _span(entry: object, kind: tuple[str, str, int], data: int, size: int, name:
     """(rows, bytes a row, file offset of row 0) of one tensor; refuses a dtype, shape or range it can't read."""
 
     part, dtype, item = kind
-    if not isinstance(entry, dict) or entry.get("dtype") != dtype:
+    if not isinstance(entry, dict) or entry.get("dtype") not in ((dtype,) if isinstance(dtype, str) else dtype):
         raise ValueError(f"{name}: the n-gram {part} must be a {dtype} tensor")
     shape, span = entry.get("shape"), entry.get("data_offsets")
     if not (isinstance(shape, list) and len(shape) == 2 and all(type(n) is int and n > 0 for n in shape)):
@@ -95,11 +96,15 @@ class SSDTable:
             index, data, size = opened[path]
             (rows, wrow, w0), (srows, grow, s0), (brows, brow, b0) = (
                 _span(entry, kind, data, size, path.name) for entry, kind in zip(entries, _KINDS))
-            if not rows == srows == brows or wrow != 8 * grow or brow != grow:
-                raise ValueError(f"{path.name}: an n-gram shard is not 4-bit rows with a scale and bias every 32")
+            # grow bytes of scalars a row = grow/2 groups of 32; wrow packs them at the stored bit width
+            k = grow // 2 * 32
+            if not rows == srows == brows or brow != grow or not k or (wrow * 8) % k \
+                    or wrow * 8 // k not in (4, 8):
+                raise ValueError(f"{path.name}: an n-gram shard is not 4/8-bit rows with a scale and bias every 32")
             if widths not in (None, (wrow, grow)):
                 raise ValueError(f"{path.name}: the n-gram shards differ in row width")
             widths = (wrow, grow)
+            meta = entries[1].get("dtype")
             total += rows * (wrow + 2 * grow)
             starts.append(starts[-1] + rows)
             fidx.append(index)
@@ -109,6 +114,9 @@ class SSDTable:
         self.fidx = np.array(fidx, dtype=np.int64)
         self.bases = np.array(bases, dtype=np.int64)        # [shard, component]: file offset of row 0
         self.wrow, self.grow = widths
+        self.bits = self.wrow * 8 // (self.grow // 2 * 32)
+        self.width = self.grow // 2 * 32
+        self.meta = {"BF16": "bf16", "F16": "f16"}.get(meta, "bf16")
         self.nbytes = total
         self._fd_of = np.array(self._fds, dtype=np.int64)
 

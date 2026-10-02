@@ -43,7 +43,16 @@ class FlashNextEngine:
 
         from tensorfold.families import quant_method, read_config
 
+        from ...qwen4_exp import mooney as mooney_manifest
+
         exl3 = is_exl3(model_dir)
+        mooney = mooney_manifest.is_mooney(model_dir)
+        if mooney:
+            refused = mooney_manifest.refusal(model_dir)
+            if refused is not None:
+                raise ValueError(refused)
+            if tp != 1:
+                raise ValueError("Mooney packs run on one GPU (the rotated experts do not shard); drop --tp 2")
         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp "
                              "2, or serve the MLX checkpoint (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP) on two")

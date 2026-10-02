@@ -325,6 +325,21 @@ class FusedDecode:
             from tensorfold.families.qwen4_exp import stream
 
             return h, (*stream.moe_rows(moe, x, logits, (se.gate_proj, se.up_proj, se.down_proj)), inject)
+        mooney = getattr(sw, "mooney", None)
+        if mooney is not None:
+            from tensorfold.kernels.qwen.flash_next.v1 import mooney as mk
+
+            dims = int(x.shape[-1])
+            rg, ru, rd = mooney["gate_proj"], mooney["up_proj"], mooney["down_proj"]
+            xg = mk.rotate(x, rg["signs"], rg["segments"], dims=dims) if rg else x
+            xu = mk.rotate(x, ru["signs"], ru["segments"], dims=dims) if ru else x
+            act, picks, weights = mk.mooney_gateup(
+                x, xg, xu, logits, cfg.num_experts_per_tok, cfg.num_experts, sw.gate_proj, sw.up_proj,
+                shared=(se.gate_proj, se.up_proj))
+            act_rot = mk.rotate(act.reshape(-1, act.shape[-1]), rd["signs"], rd["segments"],
+                                dims=int(act.shape[-1])).reshape(act.shape) if rd else act
+            y = mk.mooney_down_y(act_rot, act, picks, sw.down_proj, se.down_proj)
+            return h, ("grouped", (y, weights, logits), inject)
         act, picks, weights = experts.expert_gateup(x, logits, cfg.num_experts_per_tok, cfg.num_experts, sw.gate_proj,
                                                     sw.up_proj, shared=(se.gate_proj, se.up_proj))
         return h, ("grouped", (experts.expert_down_y(act, picks, sw.down_proj, se.down_proj), weights, logits), inject)

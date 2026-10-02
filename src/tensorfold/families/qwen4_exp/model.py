@@ -144,8 +144,15 @@ class NGramEmbedding(nn.Module):
             return rows.reshape(*ids.shape[:-1], self.heads * self.dims)
         if self.host is not None:
             words, scales, biases = self.host.gather(ids)
-            rows = mx.dequantize(mx.array(words), mx.array(scales).view(mx.bfloat16),
-                                 mx.array(biases).view(mx.bfloat16), group_size=self.quant_group, bits=self.quant_bits)
+            meta = mx.float16 if getattr(self.host, "meta", "bf16") == "f16" else mx.bfloat16
+            if meta is mx.float16:           # fp16 scales: dequantize in fp32 (exact), then round once to bf16
+                rows = mx.dequantize(mx.array(words), mx.array(scales).view(mx.float16).astype(mx.float32),
+                                     mx.array(biases).view(mx.float16).astype(mx.float32),
+                                     group_size=self.quant_group, bits=self.quant_bits).astype(mx.bfloat16)
+            else:
+                rows = mx.dequantize(mx.array(words), mx.array(scales).view(mx.bfloat16),
+                                     mx.array(biases).view(mx.bfloat16),
+                                     group_size=self.quant_group, bits=self.quant_bits)
             return embed.scaled_rows(rows, self.table_scale).reshape(*ids.shape[:-1], self.heads * self.dims)
         flat = ids.reshape(-1)
         shard = np.searchsorted(np.asarray(self.shard_starts), flat, side="right") - 1
@@ -342,6 +349,11 @@ def quant_params(config: dict[str, Any], path: str) -> dict[str, Any] | bool:
     from tensorfold.quantization import resolve_affine
 
     spec = resolve_affine(config, path.replace(".ple_embedding.shards.", ".ple_embedding.ngram_embedding.shards."))
+    if spec is None:                                     # Mooney packs may carry a `modules` glob map
+        from tensorfold.families.qwen4_exp.mooney import module_spec
+
+        found = module_spec(config, path.replace(".ple_embedding.shards.", ".ple_embedding.ngram_embedding.shards."))
+        return False if found is None else {"group_size": found[1], "bits": found[0], "mode": "affine"}
     return False if spec is None else {"group_size": spec.group_size, "bits": spec.bits, "mode": spec.mode}
 
 
@@ -429,6 +441,39 @@ def load(model_dir: Path, *, lazy: bool = False, ple_on_ssd: bool = False,
         model.load_weights(list(weights.items()), strict=False)
     else:
         model.load_weights(list(weights.items()), strict=True)
+    # A Mooney pack's rotated experts: attach each projection's rotation spec to its switch_mlp.
+    manifest_path = Path(model_dir) / "mooney_rotation.json"
+    if manifest_path.is_file():
+        from tensorfold.families.qwen4_exp import mooney as mooney_manifest
+        from tensorfold.families.qwen4_exp.model_layers import MooneySwitchGLU
+
+        man = mooney_manifest.manifest(model_dir)      # index membership was verified by check()
+        prefixes = ("", "model.", "language_model.", "language_model.model.")
+        attached = 0
+        for path, module in model.named_modules():
+            if not path.endswith("switch_mlp"):
+                continue
+            entries = {}
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                entries[proj] = next((man.for_weight(f"{pre}{path}.{proj}") for pre in prefixes
+                                      if man.for_weight(f"{pre}{path}.{proj}") is not None), None)
+            if not any(entries.values()):
+                continue
+            if not all(entries.values()):
+                raise ValueError(f"{path}: the manifest rotates only some of gate/up/down")
+            spec_map = {}
+            for proj, spec in entries.items():
+                spec_map[proj] = {"signs": mx.array(np.asarray(spec.signs, dtype=np.float32)),
+                                  "segments": spec.segments()}
+            module.__dict__["mooney"] = spec_map
+            module.__class__ = MooneySwitchGLU
+            attached += 1
+        expected = len(man.weights) // 3
+        if attached != expected or len(man.weights) % 3:
+            raise ValueError(f"mooney_rotation.json: {len(man.weights)} rotated tensors imply {expected} layers "
+                             f"but {attached} switch_mlp modules matched; refusing to run rotated weights "
+                             f"without their inverse rotation")
+        print(f"[tensorfold] Mooney rotation: {attached} MoE layers", flush=True)
     for key, value in extras.items():
         embedding = model.layers[int(key.split(".")[2])].ple.ple_embedding
         derived = getattr(embedding, _PLE_CONSTANTS[key.rsplit(".", 1)[-1]])

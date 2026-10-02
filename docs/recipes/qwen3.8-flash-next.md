@@ -380,3 +380,28 @@ TBD [release-0.3.5].
 Use `--vision` on one CUDA GPU with `--parallel` of at least two. Image requests always prefill fresh; text prefix
 caching remains available. See the [image recipe](flash-next-vision.md) for tower weights, memory admission, EXL3
 sidecar conversion and verification.
+
+## Mooney packs (rotated ternary experts)
+
+A Mooney checkpoint is an MLX-format pack whose routed experts are ternary codes in a rotated basis:
+affine 2-bit weights in groups of 128, while the dense projections, the n-gram table and the MTP head
+stay affine 8-bit in groups of 32 and small tensors are unquantized. All scales and biases are fp16.
+The pack ships `mooney_rotation.json` beside the weights: per tensor, the sign vector and contiguous
+block sizes of the rotation that must be applied to each projection's input before the matmul (sign
+flips first, then the normalized Sylvester Walsh-Hadamard, in fp32 with one rounding to bf16).
+
+```bash
+tensorfold serve <a Mooney pack>          # CUDA or Metal
+```
+
+The manifest is validated before any weight file is read; a malformed or unknown-version manifest
+refuses the checkpoint rather than loading rotated weights without their transform. Every rotated
+expert must be attached to its layer's `switch_mlp` at load, or loading fails.
+
+On CUDA the rotation runs as a Triton kernel per contiguous block (gate and up each rotate the layer
+input, down rotates each routed pair's activation); the grouped expert kernels read the 2-bit
+group-128 triples directly. Mooney packs run on one GPU. On Metal the same segmented rotation runs
+as a Metal kernel and `MooneySwitchGLU` wraps `SwitchGLU`; `prefill_mm`/`moe` fall back to the
+reference path, which the subclass rotates.
+
+Speed and memory numbers are pending measurement on the Spark; none are claimed yet.

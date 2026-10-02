@@ -225,6 +225,7 @@ class Weights:
     draft_head: Q4 | None = None   # the MTP drafts' head over a token subset (None: the full head)
     draft_ids: torch.Tensor | None = None   # the subset's token ids (this rank's share), in draft-head row order
     x3: Any = None            # an EXL3 checkpoint's shared scratch (``exl3.Scratch``); None for the MLX checkpoint
+    mooney: Any = None        # a Mooney pack's rotation manifest (mooney.Manifest); None otherwise
 
     @property
     def device(self) -> torch.device:

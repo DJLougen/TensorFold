@@ -88,7 +88,8 @@ def _topk_rows(L, PICK, WTS, NE: tl.constexpr, NL: tl.constexpr, TOPK: tl.conste
 class MoEBuffers:
     """Static scratch for up to ``rows`` rows (CUDA-graph safe); ``prefill`` picks the experts' prefill arithmetic."""
 
-    def __init__(self, rows: int, cfg, device: torch.device | str, *, prefill: bool = False) -> None:
+    def __init__(self, rows: int, cfg, device: torch.device | str, *, prefill: bool = False,
+                 mooney: bool = False) -> None:
         slots = cfg.num_experts_per_tok + 1
         self.rows, self.slots = rows, slots
         self.logits = torch.empty((rows, cfg.num_experts + 1), dtype=torch.float32, device=device)
@@ -98,6 +99,12 @@ class MoEBuffers:
         self.act = torch.empty((rows, slots, cfg.moe_intermediate_size), dtype=torch.bfloat16, device=device)
         self.y = torch.empty((rows, slots, cfg.hidden_size), dtype=torch.bfloat16 if prefill else torch.float32,
                              device=device)
+        if mooney:
+            # Mooney rotated experts: gate/up inputs and down's activations, rotated once each
+            self.rot_g = torch.empty((rows, cfg.hidden_size), dtype=torch.bfloat16, device=device)
+            self.rot_u = torch.empty((rows, cfg.hidden_size), dtype=torch.bfloat16, device=device)
+            self.rot_d = torch.empty((rows * slots, cfg.moe_intermediate_size), dtype=torch.bfloat16,
+                                     device=device)
 
 
 def select_rows(logits: torch.Tensor, buf: MoEBuffers, top_k: int, experts: int) -> None:

@@ -470,6 +470,46 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class MooneySwitchGLU(SwitchGLU):
+    """SwitchGLU whose projections read the rotated basis: each projection's input is rotated by its
+    manifest spec before the affine matmul (gate/up rotate the activation, down the pair's output)."""
+
+    def __call__(self, x: mx.array, indices) -> mx.array:
+        from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
+
+        mooney = self.__dict__["mooney"]
+        dims = int(x.shape[-1])
+        x = mx.expand_dims(x, (-2, -3))
+        indices = mx.stop_gradient(indices)
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        flat = x.reshape(-1, dims)
+        xg = _rotate(flat, mooney["gate_proj"], dims)
+        xu = _rotate(flat, mooney["up_proj"], dims) if mooney["up_proj"] is not None else flat
+        xg = xg.reshape(x.shape)
+        xu = xu.reshape(x.shape)
+        x_up = self.up_proj(xu, idx, sorted_indices=do_sort).astype(mx.bfloat16)
+        x_gate = self.gate_proj(xg, idx, sorted_indices=do_sort).astype(mx.bfloat16)
+        act = self.activation(x_up, x_gate).astype(mx.bfloat16)
+        if mooney["down_proj"] is not None:
+            aflat = act.reshape(-1, act.shape[-1])
+            act = _rotate(aflat, mooney["down_proj"], int(act.shape[-1])).reshape(act.shape)
+        x = self.down_proj(act, idx, sorted_indices=do_sort).astype(mx.bfloat16)
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
+
+
+def _rotate(x: mx.array, spec: dict, dims: int) -> mx.array:
+    """A manifest entry's signs+segments applied to rows [R, dims]."""
+    from tensorfold.kernels.qwen.flash_next.v1 import mooney as mk
+
+    return mk.rotate(x, spec["signs"], spec["segments"], dims=dims)
+
+
 class SparseMoE(nn.Module):
     def __init__(self, cfg: Config) -> None:
         super().__init__()
