@@ -15,7 +15,7 @@ import torch
 
 from .. import mooney as mf
 from ..host_table import open_table, shard_keys
-from .. import read_config
+from tensorfold.families import read_config
 from .reader import _Reader, norms_around_one
 from .weight_types import (AttnW, Config, GDNW, HC, LayerW, MoEW, MTPW, PLEW, Weights,
                            draft_token_ids)
