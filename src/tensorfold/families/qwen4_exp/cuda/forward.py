@@ -360,22 +360,22 @@ def _mooney_moe(x: torch.Tensor, ex, buf, top_k: int, experts: int, router_rows:
         ex.rot_up.apply(x, buf.rot_u[:x.shape[0]])
     else:
         buf.rot_u[:x.shape[0]].copy_(x)
-    act = buf.act.view(-1, buf.act.shape[-1])
-    ex.gate_up(buf.rot_g[:x.shape[0]], buf.rot_u[:x.shape[0]], buf.plan, act)
     rows = x.shape[0]
+    act = buf.act[:rows].view(-1, buf.act.shape[-1])
+    ex.gate_up(buf.rot_g[:rows], buf.rot_u[:rows], buf.plan, act)
     if ex.rot_down is not None:
         ex.rot_down.apply(act, buf.rot_d.view(-1, act.shape[1])[:rows * buf.slots])
         d_in = buf.rot_d.view(-1, act.shape[1])[:rows * buf.slots]
     else:
         d_in = act
-    ex.down_proj(d_in, buf.plan, buf.y.view(-1, buf.y.shape[-1]))
+    ex.down_proj(d_in, buf.plan, buf.y[:rows].view(-1, buf.y.shape[-1]))
     # the shared expert: slot ``top_k`` of every row of act/y (unrotated weights, the plain input)
     sg = ex.shared_gate(x).float()
     su = ex.shared_up(x).float()
     act[torch.arange(rows, device=x.device) * buf.slots + top_k, :ex.shared_width] = (
         sg / (1.0 + torch.exp(-sg)) * su).to(torch.bfloat16)
-    ex.shared_down(buf.act[:, top_k, :ex.shared_width],
-                   out=buf.y[:, top_k, :].view(rows, buf.y.shape[-1]))
+    ex.shared_down(buf.act[:rows, top_k, :ex.shared_width],
+                   out=buf.y[:rows, top_k, :].view(rows, buf.y.shape[-1]))
     return buf
 
 
