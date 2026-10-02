@@ -158,10 +158,13 @@ def load(model_dir: Path, device: str = "cuda", *, mtp: bool = True,
         """Routed experts (rotated 2-bit g128 when the manifest covers them) plus the shared expert."""
 
         gate_rows = raw(name + ".gate.weight").to(torch.bfloat16)
-        sw, ss, sb = triple(name + ".shared_expert_gate")
-        sfmt = spec(name + ".shared_expert_gate") or (8, 32)
-        shared_gate = dequant(name + ".shared_expert_gate", sw, ss, sb, *sfmt).to(torch.bfloat16)
-        router = torch.cat([gate_rows, shared_gate]).contiguous()
+        if rd.has(prefix + name + ".shared_expert_gate.scales"):
+            sw, ss, sb = triple(name + ".shared_expert_gate")
+            sfmt = spec(name + ".shared_expert_gate") or (8, 32)
+            shared_gate = dequant(name + ".shared_expert_gate", sw, ss, sb, *sfmt).to(torch.bfloat16)
+        else:                                    # packs keep the shared-expert gate unquantized
+            shared_gate = raw(name + ".shared_expert_gate.weight").to(torch.bfloat16)
+        router = torch.cat([gate_rows, shared_gate.reshape(-1, shared_gate.shape[-1])]).contiguous()
         gate, up, down = (triple(name + ".switch_mlp." + p)
                           for p in ("gate_proj", "up_proj", "down_proj"))
         efmt = spec(name + ".switch_mlp.gate_proj")
