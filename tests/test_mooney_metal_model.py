@@ -20,24 +20,31 @@ needs_model = pytest.mark.skipif(not MODEL or not Path(MODEL).is_dir(),
                                  reason="set TENSORFOLD_MOONEY_CUT to a tools/mooney_cut.py output")
 
 
-def _forward(model, tokens):
-    """model(inputs, cache) logits for one row of token ids, fused decode off so SparseMoE's
-    switch_mlp (the manifest's rotation site) runs."""
+def _inner(wrapper):
+    """qwen4_exp.load's FlashNext wrapper -> the underlying MLX model (named_modules lives there)."""
 
-    model.__dict__.pop("fused", None)
-    cache = model.make_cache()
-    return np.asarray(model(np.array([tokens]), cache).astype(mx.float32))
+    return wrapper.model
+
+
+def _forward(inner, tokens):
+    """model(inputs, cache) logits with the fused decode popped, so SparseMoE's switch_mlp —
+    the manifest's rotation site — runs (fused __call__ bypasses it)."""
+
+    inner.__dict__.pop("fused", None)
+    cache = inner.make_cache()
+    return np.asarray(inner(np.array([tokens]), cache).astype(mx.float32))
 
 
 @needs_model
 def test_cut_pack_loads_and_forwards():
     from tensorfold.families.qwen4_exp import load
 
-    model, tokenizer = load(Path(MODEL))
-    rotated = [m for _, m in model.named_modules() if "mooney" in getattr(m, "__dict__", {})]
+    wrapper, tokenizer = load(Path(MODEL))
+    inner = _inner(wrapper)
+    rotated = [m for _, m in inner.named_modules() if "mooney" in getattr(m, "__dict__", {})]
     man = json.loads((Path(MODEL) / "mooney_rotation.json").read_text())
     assert len(rotated) == len(man["weights"]) // 3, "not every manifest layer attached"
-    logits = _forward(model, [1, 2, 3])
+    logits = _forward(inner, [1, 2, 3])
     assert np.isfinite(logits).all(), "non-finite logits"
     assert logits.shape[-1] > 0
 
@@ -51,12 +58,13 @@ def test_rotation_is_applied_not_cosmetic():
     from tensorfold.families.qwen4_exp.model_layers import MooneySwitchGLU
     from mlx_lm.models.switch_layers import SwitchGLU
 
-    model, _ = load(Path(MODEL))
-    with_rot = _forward(model, [3, 1, 4])
-    mods = [m for _, m in model.named_modules() if isinstance(m, MooneySwitchGLU)]
+    wrapper, _ = load(Path(MODEL))
+    inner = _inner(wrapper)
+    with_rot = _forward(inner, [3, 1, 4])
+    mods = [m for _, m in inner.named_modules() if isinstance(m, MooneySwitchGLU)]
     assert mods, "no rotated layers attached"
     for m in mods:
         m.__dict__.pop("mooney", None)
         m.__class__ = SwitchGLU            # same quantized weights, no manifest transform
-    without_rot = _forward(model, [3, 1, 4])
+    without_rot = _forward(inner, [3, 1, 4])
     assert not np.allclose(with_rot, without_rot), "rotation made no difference — transform not applied"
