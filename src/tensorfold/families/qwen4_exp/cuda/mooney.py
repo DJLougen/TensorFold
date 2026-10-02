@@ -43,7 +43,7 @@ def _mooney_rotate(X, SIGNS, OUT, M, OFF: tl.constexpr, BS: tl.constexpr,
     s = tl.load(SIGNS + OFF + cols).to(tl.float32)
     v = x * s[None, :]
     for i in tl.static_range(LOG):
-        h: tl.constexpr = 1 << i
+        h = 1 << i
         a = tl.reshape(v, (16, BS // (2 * h), 2, h))
         e, o = tl.split(tl.permute(a, (0, 1, 3, 2)))
         # join puts (sum, diff) in the pair slot; permute back so it lands at stride h, not stride 2
