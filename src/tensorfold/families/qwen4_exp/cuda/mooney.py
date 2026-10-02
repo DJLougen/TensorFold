@@ -43,10 +43,10 @@ def _mooney_rotate(X, SIGNS, OUT, M, OFF: tl.constexpr, BS: tl.constexpr,
     s = tl.load(SIGNS + OFF + cols).to(tl.float32)
     v = x * s[None, :]
     for i in tl.static_range(LOG):
-        h = 1 << i
-        a = tl.reshape(v, (16, BS // (2 * h), 2, h))
+        # stage width 1 << i: a compile-time int under static_range, so every reshape dim is constant
+        a = tl.reshape(v, (16, BS // (1 << (i + 1)), 2, 1 << i))
         e, o = tl.split(tl.permute(a, (0, 1, 3, 2)))
-        # join puts (sum, diff) in the pair slot; permute back so it lands at stride h, not stride 2
+        # join puts (sum, diff) in the pair slot; permute back so it lands at stride 1 << i, not 2
         v = tl.reshape(tl.permute(tl.join(e + o, e - o), (0, 1, 3, 2)), (16, BS))
     v = v * (1.0 / (BS ** 0.5))
     tl.store(OUT + rows[:, None] * OUT_STRIDE + OFF + cols[None, :], v.to(tl.bfloat16), mask=ok)
