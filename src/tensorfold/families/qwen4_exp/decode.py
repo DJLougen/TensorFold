@@ -32,13 +32,17 @@ class _Split:
 
 
 def _stacked(linears: list[Any]) -> tuple[Any, list[int]]:
-    """One quantized linear for projections of the same input (one per bit width, groups made equal exactly)."""
+    """One matmul for projections of the same input (one per bit width; raw dense rows keep their own stack)."""
 
-    by_bits: dict[int, list[int]] = {}
+    by_kind: dict[Any, list[int]] = {}
     for i, l in enumerate(linears):
-        by_bits.setdefault(int(l.bits), []).append(i)
-    if len(by_bits) > 1:
-        return _Split([(_stacked([linears[i] for i in members])[0], members) for members in by_bits.values()]), []
+        kind = int(l.bits) if isinstance(l, nn.QuantizedLinear) else ("dense", l.weight.dtype)
+        by_kind.setdefault(kind, []).append(i)
+    if len(by_kind) > 1:
+        return _Split([(_stacked([linears[i] for i in members])[0], members)
+                       for members in by_kind.values()]), []
+    if not isinstance(linears[0], nn.QuantizedLinear):
+        return _dense_stacked(linears)
     group = min(int(l.group_size) for l in linears)
     parts = [base.QWeights(l.weight, l.scales, l.biases, l.bits, l.group_size).widened(int(l.bits), group)
              for l in linears]
@@ -59,6 +63,25 @@ def _stacked(linears: list[Any]) -> tuple[Any, list[int]]:
                                             stacked.biases[at:at + n])
             # Evaluate stacked-buffer views on this thread so the scheduler thread needs no lazy-op stream.
             mx.eval(l.weight, l.scales, l.biases)
+        at += n
+        cuts.append(at)
+    return stacked, cuts[:-1]
+
+def _dense_stacked(linears: list[Any]) -> tuple[Any, list[int]]:
+    """The quantized path's contract for raw dense linears (GDN's small b/a): one real weight, member views."""
+
+    rows = [int(l.weight.shape[0]) for l in linears]
+    stacked = nn.Linear(int(linears[0].weight.shape[1]), sum(rows), bias=any("bias" in l for l in linears))
+    stacked.weight = mx.concatenate([l.weight for l in linears])
+    if "bias" in stacked:                   # rows without one get a zero bias, so the stack keeps each output
+        stacked.bias = mx.concatenate([l.bias if "bias" in l else mx.zeros(n, dtype=stacked.weight.dtype)
+                                       for l, n in zip(linears, rows)])
+    stacked.__dict__["member_rows"] = rows
+    mx.eval(stacked.weight, *([stacked.bias] if "bias" in stacked else []))
+    cuts, at = [], 0
+    for l, n in zip(linears, rows):
+        l.weight = stacked.weight[at:at + n]
+        mx.eval(l.weight)                   # the same stacked-buffer view rule as the quantized members
         at += n
         cuts.append(at)
     return stacked, cuts[:-1]
