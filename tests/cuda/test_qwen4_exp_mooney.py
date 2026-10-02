@@ -84,7 +84,7 @@ def test_rotate_matches_fp64_sylvester(dim, blocks):
     ref = bf16(rotate_ref(x.float().numpy().astype(np.float64), signs.numpy(), blocks))
     # fp32 butterfly vs the fp64 reference: last-bit fp32 sums can flip the bf16 rounding by an
     # ulp, and near-zero outputs sit inside fp32 accumulation noise of the block's magnitude
-    scale = np.abs(x).max() * math.sqrt(max(blocks)) * 2 ** -12
+    scale = float(x.abs().float().max()) * math.sqrt(max(blocks)) * 2 ** -12
     ulp = np.abs(ref) * 2 ** -7 + np.spacing(np.abs(ref))
     assert (np.abs(got - ref) <= np.maximum(ulp * 2, scale)).all()
     row_alone = rot.apply(x[7:8].contiguous().to(DEV)).float().cpu().numpy()
