@@ -354,9 +354,11 @@ def _mooney_moe(x: torch.Tensor, ex, buf, top_k: int, experts: int, router_rows:
     moe_mod.select(buf.logits[:x.shape[0]], buf, top_k, experts, tile=16)
     if ex.rot_gate is not None:
         ex.rot_gate.apply(x, buf.rot_g[:x.shape[0]])
-        ex.rot_up.apply(x, buf.rot_u[:x.shape[0]])
     else:
         buf.rot_g[:x.shape[0]].copy_(x)
+    if ex.rot_up is not None:
+        ex.rot_up.apply(x, buf.rot_u[:x.shape[0]])
+    else:
         buf.rot_u[:x.shape[0]].copy_(x)
     act = buf.act.view(-1, buf.act.shape[-1])
     ex.gate_up(buf.rot_g[:x.shape[0]], buf.rot_u[:x.shape[0]], buf.plan, act)

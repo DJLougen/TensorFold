@@ -95,7 +95,7 @@ class Buffers:
         self.ple_s = torch.zeros((nrow, dh // 32), dtype=ple_meta, device=dev)
         self.ple_b = torch.zeros((nrow, dh // 32), dtype=ple_meta, device=dev)
         pin = torch.cuda.is_available()
-        self.ple_hw = torch.zeros((nrow, dh // 8), dtype=torch.int32, pin_memory=pin)
+        self.ple_hw = torch.zeros((nrow, dh * ple_bits // 32), dtype=torch.int32, pin_memory=pin)
         self.ple_hs = torch.zeros((nrow, dh // 32), dtype=torch.int16, pin_memory=pin)
         self.ple_hb = torch.zeros((nrow, dh // 32), dtype=torch.int16, pin_memory=pin)
         self.ple_v = torch.zeros((nrow, dh), dtype=bf, device=dev)          # a bf16 table's rows, as they ship
