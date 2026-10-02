@@ -165,6 +165,17 @@ def test_manifest_refuses_bad(tmp_path):
     assert manifest_mod.refusal(bad) is not None
 
 
+def test_module_spec_per_projection():
+    """A modules glob map resolves each projection's own format (2/128 experts under a global 8/32)."""
+
+    cfg = {"quantization": {"bits": 8, "group_size": 32, "modules": {
+        "language_model.model.layers.*.mlp.switch_mlp.*_proj": {"bits": 2, "group_size": 128}}}}
+    assert manifest_mod.module_spec(cfg, "model.layers.0.mlp.switch_mlp.gate_proj") == (2, 128)
+    assert manifest_mod.module_spec(cfg, "model.layers.0.mlp.switch_mlp.gate_proj.weight") == (2, 128)
+    assert manifest_mod.module_spec(cfg, "model.layers.0.mlp.gate") == (8, 32)
+    assert manifest_mod.module_spec(cfg, "model.layers.0.self_attn.q_proj") == (8, 32)
+
+
 # -- the real checkpoint ------------------------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def cut_model():

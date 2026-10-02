@@ -64,7 +64,7 @@ def load(model_dir: Path, device: str = "cuda", *, mtp: bool = True,
     def spec(name: str) -> tuple[int, int] | None:
         """(bits, group) the module that owns ``name``'s weight stores, None when unquantized."""
 
-        return mf.module_spec(cfg_json, name.rsplit(".", 1)[0])
+        return mf.module_spec(cfg_json, name)
 
     def triple(name: str, want: tuple[int, int] | None = None) -> tuple:
         w = raw(name + ".weight")
