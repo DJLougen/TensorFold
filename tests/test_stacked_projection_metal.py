@@ -40,7 +40,7 @@ def test_stacked_mixes_raw_dense_and_quantized_linears():
     """The model's [qkv, z, b, a] set: quantized rows and raw rows each get one matmul,
     outputs come back in member order, and no member is requantized."""
 
-    k = 256
+    k = 512
     linears = [_quantized(k, 128, 11), _quantized(k, 64, 12), _dense(k, 16, 13), _dense(k, 8, 14)]
     x = mx.random.normal((5, k), key=mx.random.key(15)).astype(mx.bfloat16)
     expected = mx.concatenate(_refs(x, linears), axis=-1)
@@ -72,13 +72,13 @@ def test_stacked_dense_linears_share_one_weight():
 def test_stacked_quantized_linears_unchanged():
     """Same-bits rows still share one QuantizedLinear; a second bit width splits by width."""
 
-    k = 256
+    k = 512
     x = mx.random.normal((4, k), key=mx.random.key(33)).astype(mx.bfloat16)
     same = [_quantized(k, 64, 31), _quantized(k, 32, 32)]
     expected = mx.concatenate(_refs(x, same), axis=-1)
     proj, cuts = decode._stacked(same)
     assert isinstance(proj, nn.QuantizedLinear)
-    assert cuts == [64] and mx.array_equal(proj(x), expected)
+    assert cuts == [64] and mx.array_equal(decode.project(x, proj), expected)
     mixed = [_quantized(k, 64, 34, bits=4), _quantized(k, 32, 35, bits=8), _quantized(k, 16, 36, bits=4)]
     expected = mx.concatenate(_refs(x, mixed), axis=-1)
     split, _ = decode._stacked(mixed)
