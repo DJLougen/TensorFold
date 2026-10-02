@@ -48,13 +48,16 @@ PREFIXES = ("language_model.mtp.", "mtp.")          # where checkpoints keep the
 
 
 def sanitize(weights: dict[str, mx.array]) -> dict[str, mx.array]:
-    """The checkpoint's MTP tensors under this module's names."""
+    """The checkpoint's MTP tensors under this module's names, the one-row shared gate back to 2D."""
 
     out = {}
     for name, value in weights.items():
         for prefix in PREFIXES:
             if name.startswith(prefix):
-                out[name[len(prefix):]] = value
+                key = name[len(prefix):]
+                if key.endswith("shared_expert_gate.weight") and value.ndim == 1:
+                    value = value.reshape(1, -1)        # GGUF stores Linear(d, 1) as a bare vector
+                out[key] = value
     return out
 
 
