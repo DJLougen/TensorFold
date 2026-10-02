@@ -29,6 +29,7 @@ MODEL = os.environ.get("TENSORFOLD_MOONEY_FLASHNEXT", "")
 LAYERS = int(os.environ.get("TENSORFOLD_MOONEY_FLASHNEXT_LAYERS", "4"))
 needs_model = pytest.mark.skipif(not MODEL or not Path(MODEL).is_dir(),
                                  reason="set TENSORFOLD_MOONEY_FLASHNEXT to a Mooney checkpoint")
+WINDOWS = (1, 2, 3, 16, 17, 64, 128)
 
 
 def sylvester(n: int) -> np.ndarray:
@@ -44,7 +45,7 @@ def rotate_ref(x: np.ndarray, signs: np.ndarray, blocks: list[int]) -> np.ndarra
     out = np.zeros_like(x, dtype=np.float64)
     off = 0
     for b in blocks:
-        out[:, off:off + b] = (sylvester(b) @ (signs[off:off + b] * x[:, off:off + b].T).T).T / math.sqrt(b)
+        out[:, off:off + b] = (x[:, off:off + b] * signs[None, off:off + b]) @ sylvester(b).T / math.sqrt(b)
         off += b
     return out
 
@@ -110,7 +111,7 @@ def pack_affine(w: np.ndarray, bits: int, group: int) -> tuple[np.ndarray, np.nd
     q = np.clip(np.round((wr - lo) / s[..., None]), 0, (1 << bits) - 1).astype(np.int64)
     packed = np.zeros((n, k * bits // 32), np.uint32)
     for j in range(k):
-        packed[:, j // per] |= q[:, j // group, j % group] << ((j % per) * bits)
+        packed[:, j // per] |= q[:, j // group, j % group].astype(np.uint32) << np.uint32((j % per) * bits)
     return packed.view(np.int32), s, b
 
 
