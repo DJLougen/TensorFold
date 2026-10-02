@@ -27,10 +27,9 @@ def _inner(wrapper):
 
 
 def _forward(inner, tokens):
-    """model(inputs, cache) logits with the fused decode popped, so SparseMoE's switch_mlp —
-    the manifest's rotation site — runs (fused __call__ bypasses it)."""
+    """model(inputs, cache) logits on the DEFAULT path (fused decode kept — it applies the
+    manifest rotation through the mooney branch of FusedDecode._moe)."""
 
-    inner.__dict__.pop("fused", None)
     cache = inner.make_cache()
     return np.asarray(inner(np.array([tokens]), cache).astype(mx.float32))
 
@@ -56,7 +55,6 @@ def test_rotation_is_applied_not_cosmetic():
 
     from tensorfold.families.qwen4_exp import load
     from tensorfold.families.qwen4_exp.model_layers import MooneySwitchGLU
-    from mlx_lm.models.switch_layers import SwitchGLU
 
     wrapper, _ = load(Path(MODEL))
     inner = _inner(wrapper)
@@ -64,7 +62,6 @@ def test_rotation_is_applied_not_cosmetic():
     mods = [m for _, m in inner.named_modules() if isinstance(m, MooneySwitchGLU)]
     assert mods, "no rotated layers attached"
     for m in mods:
-        m.__dict__.pop("mooney", None)
-        m.__class__ = SwitchGLU            # same quantized weights, no manifest transform
+        m.__dict__.pop("mooney", None)     # fused _moe reads this dict; dropping it = same weights, no transform
     without_rot = _forward(inner, [3, 1, 4])
     assert not np.allclose(with_rot, without_rot), "rotation made no difference — transform not applied"
