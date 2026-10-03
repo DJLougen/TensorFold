@@ -1,7 +1,9 @@
 """Mooney on Metal, cut model: a pack truncated by ``tools/mooney_cut.py`` loads on MLX, the
 manifest's rotations attach to every switch_mlp, and a forward produces finite logits.
 
-``TENSORFOLD_MOONEY_CUT=<dir from mooney_cut.py>`` gates the load. The test also runs the model
+``TENSORFOLD_MOONEY_CUT=<dir from mooney_cut.py>`` gates the load. PLE stays on SSD (all rows preserved),
+so warming the entire table cannot displace RAM on a small Mac. MTP and fused decode remain enabled.
+The test also runs the model
 without its manifest attached (module reclasses reverted) to prove the rotations change the result
 — a Mooney pack's rotated experts give different bits than the same weights unrotated.
 """
@@ -38,7 +40,7 @@ def _forward(inner, tokens):
 def test_cut_pack_loads_and_forwards():
     from tensorfold.families.qwen4_exp import load
 
-    wrapper, tokenizer = load(Path(MODEL))
+    wrapper, tokenizer = load(Path(MODEL), ple_on_ssd=True)
     inner = _inner(wrapper)
     rotated = [m for _, m in inner.named_modules() if "mooney" in getattr(m, "__dict__", {})]
     man = json.loads((Path(MODEL) / "mooney_rotation.json").read_text())
@@ -56,7 +58,7 @@ def test_rotation_is_applied_not_cosmetic():
     from tensorfold.families.qwen4_exp import load
     from tensorfold.families.qwen4_exp.model_layers import MooneySwitchGLU
 
-    wrapper, _ = load(Path(MODEL))
+    wrapper, _ = load(Path(MODEL), ple_on_ssd=True)
     inner = _inner(wrapper)
     with_rot = _forward(inner, [3, 1, 4])
     mods = [m for _, m in inner.named_modules() if isinstance(m, MooneySwitchGLU)]

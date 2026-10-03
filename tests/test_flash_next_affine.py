@@ -141,6 +141,69 @@ def test_lookups_equal_mlx_dequantize(fmt):
     assert same(got[:, :512], ref) and same(got[:, 512:], ref)
 
 
+def dense_f16(linear):
+    """The same fp32 dequantization, one bf16 rounding, of a table whose scales and biases are stored fp16."""
+
+    return mx.dequantize(linear.weight, linear.scales.astype(mx.float32), linear.biases.astype(mx.float32),
+                         group_size=linear.group_size, bits=linear.bits).astype(mx.bfloat16)
+
+
+def f16_meta(linear):
+    """The same affine row bits with their scales and biases stored fp16 (Mooney packs): no requantization."""
+
+    return Linear(linear.weight, linear.scales.astype(mx.float16), linear.biases.astype(mx.float16),
+                  linear.bits, linear.group_size)
+
+
+@pytest.mark.parametrize("fmt", [(4, 32), (8, 32), (4, 64)])
+def test_lookups_match_stored_fp16_meta(fmt):
+    # half * bfloat does not compile; the kernels promote the fp16 meta to fp32 and round once to bf16.
+    rng = np.random.default_rng(fmt[0] + fmt[1])
+    table = f16_meta(quantized(rng, (300, 512), *fmt))
+    ids = mx.array(rng.integers(0, 300, size=(7,)).astype(np.uint32))
+    ref = dense_f16(table)[ids]
+    got = embed.embed_rows(ids, table, tile=2)
+    assert got.dtype == mx.bfloat16 and same(got[:, :512], ref) and same(got[:, 512:], ref)
+
+
+class Ple:
+    """PleTables reads this off the embedding: a synthetic or a fake-host n-gram table."""
+
+    def __init__(self, shards, host=None):
+        self.dims = int(shards[0].weight.shape[1]) * 32 // shards[0].bits
+        self.quant_bits, self.quant_group = int(shards[0].bits), int(shards[0].group_size)
+        self.table_scale, self.host, self.shards = 1.0, host, shards
+
+
+class FakeHost:
+    """host_table's gather: rows' words and fp16 scales and biases as raw uint16 bits."""
+
+    meta = "f16"
+
+    def __init__(self, shards):
+        self.words = [np.asarray(sh.weight, dtype=np.uint32) for sh in shards]
+        self.scales = [np.asarray(sh.scales.astype(mx.float16).view(mx.uint16)) for sh in shards]
+        self.biases = [np.asarray(sh.biases.astype(mx.float16).view(mx.uint16)) for sh in shards]
+
+    def gather(self, ids):
+        flat = np.asarray(ids).reshape(-1)
+        words = np.concatenate(self.words)[flat]
+        scales = np.concatenate(self.scales)[flat]
+        biases = np.concatenate(self.biases)[flat]
+        return words, scales, biases
+
+
+@pytest.mark.parametrize("fmt,host", [((4, 32), False), ((8, 32), False), ((4, 32), True), ((8, 32), True)])
+def test_ple_lookups_match_stored_fp16_meta(fmt, host):
+    rng = np.random.default_rng(fmt[0] + fmt[1] + host)
+    shards = [f16_meta(quantized(rng, (24, 128), *fmt)) for _ in range(8)]
+    ids = rng.integers(0, 192, size=(3, 4)).astype(np.uint32)
+    emb = Ple(shards, host=FakeHost(shards) if host else None)
+    got = embed.ple_lookup(ids, embed.PleTables(emb))
+    ref = mx.concatenate([dense_f16(sh) for sh in shards])[mx.array(ids.reshape(-1))].reshape(3, 4 * 128)
+    assert got.dtype == mx.bfloat16 and same(got, ref)
+
+
 @pytest.mark.skipif(not __import__("tensorfold.families.qwen3_5", fromlist=["tensor_units"]).tensor_units(),
                     reason="the lane matmul needs the M5's tensor units")
 @pytest.mark.parametrize("fmt", [(5, 32), (6, 32), (8, 32), (3, 32), (2, 32), (5, 64)])

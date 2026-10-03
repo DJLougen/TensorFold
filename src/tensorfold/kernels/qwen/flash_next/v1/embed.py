@@ -171,13 +171,51 @@ _EMBED_ROWS_Q = edited(_EMBED_ROWS, [("  const uint word = W[row * (DIMS / 8) + 
     "const bfloat v = SC[row * (DIMS / 32) + d / 32] * q + BI[row * (DIMS / 32) + d / 32];",
     "const bfloat v = SC[row * (DIMS / GS) + d / GS] * q + BI[row * (DIMS / GS) + d / GS];")])
 
+# The same lookups for fp16 scales and biases (Mooney packs): the loads promote to fp32 and the result rounds
+# once to bf16 (host_table's fp32 dequantization), instead of the bf16 arithmetic that mirrors mx.dequantize on
+# bf16 meta. half * bfloat does not compile, so these are separate sources, not casts on the bf16 ones.
+_PLE_LOOKUP_F16 = edited(_PLE_LOOKUP, [(
+    "const device uint32_t* W; const device bfloat* SC; const device bfloat* BI;",
+    "const device uint32_t* W; const device half* SC; const device half* BI;"), (
+    "const bfloat sc = SC[row * (DIMS / 32) + d / 32], bi = BI[row * (DIMS / 32) + d / 32];",
+    "const float sc = SC[row * (DIMS / 32) + d / 32], bi = BI[row * (DIMS / 32) + d / 32];"), (
+    "OUT[(r * H + h) * DIMS + d] = sc * q + bi;",
+    "OUT[(r * H + h) * DIMS + d] = bfloat(sc * float(q) + bi);")])
+_PLE_ROWS_F16 = edited(_PLE_ROWS, [(
+    "const bfloat sc = SC[i * (DIMS / 32) + d / 32], bi = BI[i * (DIMS / 32) + d / 32];",
+    "const float sc = SC[i * (DIMS / 32) + d / 32], bi = BI[i * (DIMS / 32) + d / 32];"), (
+    "OUT[i * DIMS + d] = sc * q + bi;",
+    "OUT[i * DIMS + d] = bfloat(sc * float(q) + bi);")])
+_EMBED_ROWS_F16 = edited(_EMBED_ROWS, [(
+    "const bfloat v = SC[row * (DIMS / 32) + d / 32] * q + BI[row * (DIMS / 32) + d / 32];",
+    "const bfloat v = bfloat(SC[row * (DIMS / 32) + d / 32] * float(q) + BI[row * (DIMS / 32) + d / 32]);")])
+_PLE_LOOKUP_Q_F16 = edited(_PLE_LOOKUP_Q, [(
+    "const device uint32_t* W; const device bfloat* SC; const device bfloat* BI;",
+    "const device uint32_t* W; const device half* SC; const device half* BI;"), (
+    "const bfloat sc = SC[row * (DIMS / GS) + d / GS], bi = BI[row * (DIMS / GS) + d / GS];",
+    "const float sc = SC[row * (DIMS / GS) + d / GS], bi = BI[row * (DIMS / GS) + d / GS];"), (
+    "OUT[(r * H + h) * DIMS + d] = sc * q + bi;",
+    "OUT[(r * H + h) * DIMS + d] = bfloat(sc * float(q) + bi);")])
+_PLE_ROWS_Q_F16 = edited(_PLE_ROWS_Q, [(
+    "const bfloat sc = SC[i * (DIMS / GS) + d / GS], bi = BI[i * (DIMS / GS) + d / GS];",
+    "const float sc = SC[i * (DIMS / GS) + d / GS], bi = BI[i * (DIMS / GS) + d / GS];"), (
+    "OUT[i * DIMS + d] = sc * q + bi;",
+    "OUT[i * DIMS + d] = bfloat(sc * float(q) + bi);")])
+_EMBED_ROWS_Q_F16 = edited(_EMBED_ROWS_Q, [(
+    "const bfloat v = SC[row * (DIMS / GS) + d / GS] * q + BI[row * (DIMS / GS) + d / GS];",
+    "const bfloat v = bfloat(SC[row * (DIMS / GS) + d / GS] * float(q) + BI[row * (DIMS / GS) + d / GS]);")])
 
-def _lookup(name: str, q4: Any, generic: Any, inputs: list[str], bits: int, group: int) -> tuple[Any, list]:
-    """The 4-bit group-32 kernel, or the any-width one with its format as template constants."""
 
+def _lookup(name: str, q4: tuple[str, str], generic: tuple[str, str], inputs: list[str], bits: int, group: int,
+            meta: Any) -> tuple[Any, list]:
+    """The 4-bit group-32 kernel, or the any-width one with its format as template constants. ``meta`` is the
+    scales' (and biases') stored dtype: fp16 uses the *_F16 sources, whose kernel names keep an ``_f16`` suffix."""
+
+    f16 = int(meta == mx.float16)
+    suffix = "_f16" if f16 else ""
     if (bits, group) == (4, 32):
-        return kernel(f"q4_{name}", q4, inputs, ["OUT"]), []
-    return (kernel(f"qa_{name}", generic, inputs, ["OUT"], header=QDOT_HEADER + AFFINE_HEADER),
+        return kernel(f"q4_{name}{suffix}", q4[f16], inputs, ["OUT"]), []
+    return (kernel(f"qa_{name}{suffix}", generic[f16], inputs, ["OUT"], header=QDOT_HEADER + AFFINE_HEADER),
             [("BITS", bits), ("GS", group)])
 
 
@@ -244,13 +282,16 @@ def _ple_lookup(ids: Any, tables: PleTables) -> mx.array:
     rows, heads = ids.shape
     if tables.host is not None:
         words, scales, biases = tables.host.gather(ids)
-        run, fmt = _lookup("ple_rows", _PLE_ROWS, _PLE_ROWS_Q, ["W", "SC", "BI"], tables.bits, tables.group)
-        return run(inputs=[mx.array(words), mx.array(scales).view(mx.bfloat16), mx.array(biases).view(mx.bfloat16)],
+        meta = mx.float16 if getattr(tables.host, "meta", "bf16") == "f16" else mx.bfloat16
+        run, fmt = _lookup("ple_rows", (_PLE_ROWS, _PLE_ROWS_F16), (_PLE_ROWS_Q, _PLE_ROWS_Q_F16),
+                           ["W", "SC", "BI"], tables.bits, tables.group, meta)
+        return run(inputs=[mx.array(words), mx.array(scales).view(meta), mx.array(biases).view(meta)],
                    template=[("DIMS", tables.dims), *fmt], grid=(tables.dims, rows * heads, 1),
                    threadgroup=(tables.dims, 1, 1), output_shapes=[(rows, heads * tables.dims)],
                    output_dtypes=[mx.bfloat16])[0]
     names = ["IDS", "GSTART"] + [f"{k}{g}" for g in range(8) for k in ("W", "S", "B")]
-    run, fmt = _lookup("ple_lookup", _PLE_LOOKUP, _PLE_LOOKUP_Q, names, tables.bits, tables.group)
+    run, fmt = _lookup("ple_lookup", (_PLE_LOOKUP, _PLE_LOOKUP_F16), (_PLE_LOOKUP_Q, _PLE_LOOKUP_Q_F16),
+                       names, tables.bits, tables.group, tables.scales[0].dtype)
     arrays = [ids if isinstance(ids, mx.array) else mx.array(ids.astype(np.uint32)), tables.starts]
     for g in range(8):
         arrays += [tables.weights[g], tables.scales[g], tables.biases[g]]
@@ -268,7 +309,8 @@ def embed_rows(ids: Any, embedding: Any, *, tile: int = 1) -> mx.array:
     rows = int(ids.size)
     bits, group = int(getattr(embedding, "bits", 4)), int(getattr(embedding, "group_size", 32))
     dims = int(embedding.weight.shape[1]) * 32 // bits
-    run, fmt = _lookup("embed_rows", _EMBED_ROWS, _EMBED_ROWS_Q, ["IDS", "W", "SC", "BI"], bits, group)
+    run, fmt = _lookup("embed_rows", (_EMBED_ROWS, _EMBED_ROWS_F16), (_EMBED_ROWS_Q, _EMBED_ROWS_Q_F16),
+                       ["IDS", "W", "SC", "BI"], bits, group, embedding.scales.dtype)
     return run(inputs=[padded(ids.reshape(-1).astype(mx.uint32)), embedding.weight, embedding.scales, embedding.biases],
                   template=[("DIMS", dims), ("TILE", tile), *fmt], grid=(dims, rows, 1),
                   threadgroup=(min(dims, 256), 1, 1),
